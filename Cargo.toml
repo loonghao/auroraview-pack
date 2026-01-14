@@ -81,8 +81,8 @@ image = "0.25"
 # ICO file format
 ico = "0.5"
 
-# Code protection (optional) - uses Git dependency
-auroraview-protect = { git = "https://github.com/loonghao/auroraview-protect.git", optional = true }
+# Code protection (optional) - uses sibling submodule
+auroraview-protect = { path = "../auroraview-protect", optional = true }
 
 [features]
 default = []

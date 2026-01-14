@@ -21,7 +21,7 @@
 //! - py2pyd: C compiler + Cython via uv (slow)
 
 #[cfg(feature = "code-protection")]
-use aurora_protect::{
+use auroraview_protect::{
     protect_with_bytecode, EncryptionConfig, ProtectConfig, ProtectionMethod, Protector,
 };
 
@@ -339,7 +339,7 @@ pub fn check_build_tools_available(method: ProtectionMethodConfig) -> PackResult
         ProtectionMethodConfig::Py2Pyd => {
             #[cfg(feature = "code-protection")]
             {
-                aurora_protect::py2pyd::verify_build_tools()
+                auroraview_protect::py2pyd::verify_build_tools()
                     .map(|_| ())
                     .map_err(|e| PackError::Config(format!("Build tools not available: {}", e)))
             }
