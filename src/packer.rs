@@ -1058,13 +1058,30 @@ elif spec and spec.origin:
     print(os.path.dirname(spec.origin))
 "#;
 
-        // Use "python" as the default executable
-        let python_exe = "python";
+        // Try to find Python executable - check multiple common names
+        let python_candidates = ["python", "python3", "python3.11", "python3.10", "python3.9"];
+        let mut python_output = None;
 
-        let output = Command::new(python_exe)
-            .args(["-c", script])
-            .output()
-            .map_err(|e| PackError::Config(format!("Failed to run Python: {}", e)))?;
+        for python_exe in python_candidates {
+            match Command::new(python_exe).args(["-c", script]).output() {
+                Ok(output) => {
+                    python_output = Some(output);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        let output = match python_output {
+            Some(out) => out,
+            None => {
+                tracing::warn!("Python not found in PATH - skipping _core extension merge");
+                tracing::warn!(
+                    "To merge _core extension, ensure Python is installed and auroraview wheel is available"
+                );
+                return Ok(0);
+            }
+        };
 
         if !output.status.success() {
             tracing::warn!("Could not find installed auroraview package to merge _core extension");
@@ -1237,6 +1254,16 @@ elif spec and spec.origin:
         let collector = DepsCollector::new()
             .include(packages_to_collect.iter().cloned())
             .exclude(python.exclude.iter().cloned());
+
+        // Check if Python is available before proceeding
+        if !collector.is_python_available() {
+            tracing::warn!("Python not found in PATH - skipping dependency collection");
+            tracing::warn!(
+                "Packages {:?} will need to be installed in the target Python environment",
+                packages_to_collect
+            );
+            return Ok(0);
+        }
 
         // Log Python environment info for debugging
         collector.log_python_info();

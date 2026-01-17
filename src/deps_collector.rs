@@ -125,10 +125,34 @@ impl DepsCollector {
     /// Create a new dependency collector
     pub fn new() -> Self {
         Self {
-            python_exe: PathBuf::from("python"),
+            python_exe: Self::find_python_executable(),
             exclude_packages: default_excludes(),
             include_packages: HashSet::new(),
         }
+    }
+
+    /// Find a working Python executable
+    fn find_python_executable() -> PathBuf {
+        let candidates = ["python", "python3", "python3.11", "python3.10", "python3.9"];
+
+        for candidate in candidates {
+            if let Ok(output) = Command::new(candidate).args(["--version"]).output() {
+                if output.status.success() {
+                    return PathBuf::from(candidate);
+                }
+            }
+        }
+
+        // Fall back to "python" even if not found - will fail later with better error message
+        PathBuf::from("python")
+    }
+
+    /// Check if Python is available
+    pub fn is_python_available(&self) -> bool {
+        Command::new(&self.python_exe)
+            .args(["--version"])
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Set the Python executable to use
