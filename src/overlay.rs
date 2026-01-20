@@ -140,7 +140,19 @@ impl OverlayWriter {
     /// the original executable content.
     ///
     /// The content hash is computed before writing if not already set.
+    /// Uses zstd compression with configurable level (default 19 for high compression).
     pub fn write(exe_path: &Path, data: &OverlayData) -> PackResult<()> {
+        Self::write_with_level(exe_path, data, data.config.compression_level)
+    }
+
+    /// Write overlay data with specific compression level
+    ///
+    /// Compression levels:
+    /// - 1-3: Fast compression, lower ratio (good for development)
+    /// - 10-15: Balanced compression
+    /// - 16-19: High compression (recommended for release)
+    /// - 20-22: Ultra compression (very slow, marginal improvement)
+    pub fn write_with_level(exe_path: &Path, data: &OverlayData, level: i32) -> PackResult<()> {
         // Clone and compute hash if needed
         let mut data = data.clone();
         let content_hash = data.get_content_hash();
@@ -151,6 +163,9 @@ impl OverlayWriter {
         // Get the current end of file (where overlay starts)
         let overlay_start = writer.seek(SeekFrom::End(0))?;
 
+        // Clamp level to valid range (1-22)
+        let level = level.clamp(1, 22);
+
         // Create a metadata object that includes the hash
         let metadata = OverlayMetadata {
             config: data.config.clone(),
@@ -158,16 +173,33 @@ impl OverlayWriter {
         };
         let metadata_json = serde_json::to_vec(&metadata)?;
 
-        // Compress config with zstd
+        // Compress config with zstd (use level 3 for small metadata)
         let config_compressed = zstd::encode_all(&metadata_json[..], 3)
             .map_err(|e| PackError::Compression(e.to_string()))?;
 
         // Create tar archive for assets
         let assets_tar = Self::create_assets_archive(&data.assets)?;
+        let uncompressed_size = assets_tar.len();
 
-        // Compress assets with zstd
-        let assets_compressed = zstd::encode_all(&assets_tar[..], 3)
+        // Compress assets with zstd at specified level
+        tracing::info!(
+            "Compressing {:.2} MB of assets with zstd level {}...",
+            uncompressed_size as f64 / (1024.0 * 1024.0),
+            level
+        );
+        let compress_start = std::time::Instant::now();
+        let assets_compressed = zstd::encode_all(&assets_tar[..], level)
             .map_err(|e| PackError::Compression(e.to_string()))?;
+        let compress_time = compress_start.elapsed();
+
+        let compression_ratio = uncompressed_size as f64 / assets_compressed.len() as f64;
+        tracing::info!(
+            "Compression complete: {:.2} MB -> {:.2} MB ({:.1}x ratio) in {:.1}s",
+            uncompressed_size as f64 / (1024.0 * 1024.0),
+            assets_compressed.len() as f64 / (1024.0 * 1024.0),
+            compression_ratio,
+            compress_time.as_secs_f64()
+        );
 
         // Write header
         writer.write_all(OVERLAY_MAGIC)?;

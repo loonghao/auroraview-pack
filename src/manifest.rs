@@ -1103,6 +1103,16 @@ pub struct BuildConfig {
     /// Features to enable
     #[serde(default)]
     pub features: Vec<String>,
+
+    /// Compression level for assets (1-22, default 19)
+    /// Higher levels = better compression but slower packing
+    /// Recommended: 19 for release, 3 for development
+    #[serde(default = "default_compression_level")]
+    pub compression_level: i32,
+}
+
+fn default_compression_level() -> i32 {
+    19
 }
 
 // ============================================================================
@@ -1580,16 +1590,12 @@ pub struct DownloadEntry {
 /// Download stage enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DownloadStage {
+    #[default]
     BeforeCollect,
     BeforePack,
     AfterPack,
-}
-
-impl Default for DownloadStage {
-    fn default() -> Self {
-        Self::BeforeCollect
-    }
 }
 
 fn default_download_stage() -> DownloadStage {

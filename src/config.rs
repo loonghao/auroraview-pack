@@ -320,6 +320,17 @@ pub struct PackConfig {
     /// Downloads configuration for embedding external dependencies
     #[serde(default)]
     pub downloads: Vec<crate::manifest::DownloadEntry>,
+
+    /// Compression level for assets (1-22, default 19 for best ratio)
+    /// Higher levels = better compression but slower packing
+    /// Recommended: 19 for release, 3 for development
+    #[serde(default = "default_compression_level")]
+    pub compression_level: i32,
+}
+
+/// Default compression level (19 = high compression, good for releases)
+fn default_compression_level() -> i32 {
+    19
 }
 
 /// Serde helper module for serializing Option<Vec<u8>> as base64
@@ -385,6 +396,7 @@ impl PackConfig {
             windows_resource: WindowsPlatformConfig::default(),
             vx: None,
             downloads: vec![],
+            compression_level: default_compression_level(),
         }
     }
 
@@ -417,6 +429,7 @@ impl PackConfig {
             windows_resource: WindowsPlatformConfig::default(),
             vx: None,
             downloads: vec![],
+            compression_level: default_compression_level(),
         }
     }
 
@@ -452,6 +465,7 @@ impl PackConfig {
             windows_resource: WindowsPlatformConfig::default(),
             vx: None,
             downloads: vec![],
+            compression_level: default_compression_level(),
         }
     }
 
@@ -490,6 +504,7 @@ impl PackConfig {
             windows_resource: WindowsPlatformConfig::default(),
             vx: None,
             downloads: vec![],
+            compression_level: default_compression_level(),
         }
     }
 

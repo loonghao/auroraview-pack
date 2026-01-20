@@ -11,7 +11,7 @@ use crate::resource_editor::ResourceEditor;
 use crate::{Manifest, PackConfig, PackError, PackMode, PackResult, PythonBundleConfig};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Normalize a path by removing `.` and resolving `..` components
 fn normalize_path(path: &Path) -> PathBuf {
@@ -460,6 +460,10 @@ impl Packer {
         // Bundle Python code
         let python_file_count = self.bundle_python_code(&mut overlay, python)?;
 
+        // Install Python packages (third-party dependencies)
+        let package_file_count =
+            self.install_packages_for_standalone(&mut overlay, python, &standalone)?;
+
         // Collect additional resources from hooks
         let resource_count = self.collect_hook_resources(&mut overlay)?;
         if resource_count > 0 {
@@ -481,11 +485,12 @@ impl Packer {
         let size = fs::metadata(&output_path)?.len();
 
         tracing::info!(
-            "Pack complete: {} ({:.2} MB, {} assets, {} python files, {} resources)",
+            "Pack complete: {} ({:.2} MB, {} assets, {} python files, {} package files, {} resources)",
             output_path.display(),
             size as f64 / (1024.0 * 1024.0),
             asset_count,
             python_file_count,
+            package_file_count,
             resource_count
         );
 
@@ -1396,11 +1401,24 @@ elif spec and spec.origin:
         Ok(count)
     }
 
-    /// Install Python packages using pip
+    /// Install Python packages using pip (for portable mode with system Python)
     fn install_python_packages(
         &self,
         lib_dir: &Path,
         python: &PythonBundleConfig,
+    ) -> PackResult<()> {
+        self.install_packages_with_python(lib_dir, python, None)
+    }
+
+    /// Install Python packages using a specific Python executable
+    ///
+    /// If `python_exe` is None, tries system Python commands.
+    /// If `python_exe` is Some, uses that specific Python executable.
+    fn install_packages_with_python(
+        &self,
+        lib_dir: &Path,
+        python: &PythonBundleConfig,
+        python_exe: Option<&Path>,
     ) -> PackResult<()> {
         let mut packages = python.packages.clone();
 
@@ -1421,33 +1439,276 @@ elif spec and spec.origin:
             return Ok(());
         }
 
-        tracing::info!("Installing {} Python packages...", packages.len());
+        tracing::info!(
+            "Installing {} Python packages: {:?}",
+            packages.len(),
+            packages
+        );
 
-        // Use pip to install packages to lib_dir
-        let status = std::process::Command::new("pip")
+        // If a specific Python executable is provided, use it
+        if let Some(exe) = python_exe {
+            return self.pip_install_with_exe(exe, lib_dir, &packages);
+        }
+
+        // Try different Python commands (system Python fallback)
+        let python_commands = ["python", "python3", "py"];
+        let mut pip_success = false;
+
+        for python_cmd in &python_commands {
+            let status = Command::new(python_cmd)
+                .args([
+                    "-m",
+                    "pip",
+                    "install",
+                    "--target",
+                    lib_dir.to_str().unwrap_or("."),
+                    "--upgrade",
+                ])
+                .args(&packages)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    tracing::info!(
+                        "Python packages installed successfully using {}",
+                        python_cmd
+                    );
+                    pip_success = true;
+                    break;
+                }
+                Ok(s) => {
+                    tracing::debug!("{} -m pip exited with status: {}", python_cmd, s);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to run {} -m pip: {}", python_cmd, e);
+                }
+            }
+        }
+
+        if !pip_success {
+            tracing::warn!("Failed to install Python packages with pip, trying uv...");
+            let status = Command::new("uv")
+                .args([
+                    "pip",
+                    "install",
+                    "--target",
+                    lib_dir.to_str().unwrap_or("."),
+                ])
+                .args(&packages)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    tracing::info!("Python packages installed successfully using uv");
+                }
+                Ok(s) => {
+                    tracing::warn!("uv pip install exited with status: {}", s);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to run uv pip: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Install packages using a specific Python executable
+    fn pip_install_with_exe(
+        &self,
+        python_exe: &Path,
+        lib_dir: &Path,
+        packages: &[String],
+    ) -> PackResult<()> {
+        tracing::info!("Using bundled Python: {}", python_exe.display());
+
+        // First, ensure pip is available using ensurepip (suppress output)
+        tracing::info!("Ensuring pip is available...");
+        let ensurepip_status = Command::new(python_exe)
+            .args(["-m", "ensurepip", "--upgrade"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        match ensurepip_status {
+            Ok(s) if s.success() => {
+                tracing::info!("pip ensured successfully");
+            }
+            Ok(s) => {
+                tracing::debug!(
+                    "ensurepip exited with status: {} (pip may already exist)",
+                    s
+                );
+            }
+            Err(e) => {
+                tracing::debug!("ensurepip failed: {} (pip may already exist)", e);
+            }
+        }
+
+        // Upgrade pip to latest version (suppress output)
+        tracing::info!("Upgrading pip...");
+        let _ = Command::new(python_exe)
+            .args(["-m", "pip", "install", "--upgrade", "pip", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        // Now install packages with progress info
+        tracing::info!(
+            "Installing {} packages to: {}",
+            packages.len(),
+            lib_dir.display()
+        );
+        tracing::info!("Packages: {:?}", packages);
+
+        // Use --progress-bar off and -q for quieter output, capture stderr for errors
+        let output = Command::new(python_exe)
             .args([
+                "-m",
+                "pip",
                 "install",
                 "--target",
                 lib_dir.to_str().unwrap_or("."),
-                "--no-deps",
+                "--upgrade",
+                "--progress-bar",
+                "off",
+                "-q",
             ])
-            .args(&packages)
-            .status();
+            .args(packages)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| {
+                PackError::Config(format!("Failed to run pip with bundled Python: {}", e))
+            })?;
 
-        match status {
-            Ok(s) if s.success() => {
-                tracing::info!("Python packages installed successfully");
-                Ok(())
-            }
-            Ok(s) => {
-                tracing::warn!("pip install exited with status: {}", s);
-                Ok(()) // Continue even if pip fails
-            }
-            Err(e) => {
-                tracing::warn!("Failed to run pip: {}", e);
-                Ok(()) // Continue even if pip is not available
+        if output.status.success() {
+            tracing::info!("Python packages installed successfully using bundled Python");
+            Ok(())
+        } else {
+            // Show stderr on failure
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(PackError::Config(format!(
+                "pip install failed with status: {}\nstderr: {}",
+                output.status, stderr
+            )))
+        }
+    }
+
+    /// Install Python packages for standalone mode and bundle into overlay
+    ///
+    /// This:
+    /// 1. Extracts the Python distribution to a temp directory
+    /// 2. Ensures pip is available (ensurepip)
+    /// 3. Installs packages to a lib directory
+    /// 4. Bundles the lib directory into overlay
+    fn install_packages_for_standalone(
+        &self,
+        overlay: &mut OverlayData,
+        python: &PythonBundleConfig,
+        standalone: &PythonStandalone,
+    ) -> PackResult<usize> {
+        let mut packages = python.packages.clone();
+
+        // Read from requirements.txt if specified
+        if let Some(ref req_path) = python.requirements {
+            if req_path.exists() {
+                let content = fs::read_to_string(req_path)?;
+                for line in content.lines() {
+                    let line = line.trim();
+                    if !line.is_empty() && !line.starts_with('#') {
+                        packages.push(line.to_string());
+                    }
+                }
             }
         }
+
+        if packages.is_empty() {
+            tracing::info!("No Python packages to install");
+            return Ok(0);
+        }
+
+        tracing::info!(
+            "Installing {} Python packages for standalone mode: {:?}",
+            packages.len(),
+            packages
+        );
+
+        // Create temp directory for extraction
+        let temp_dir = tempfile::tempdir().map_err(|e| PackError::Io(std::io::Error::other(e)))?;
+
+        // Extract Python to temp directory
+        let python_exe = standalone.extract(temp_dir.path())?;
+        tracing::info!("Extracted Python to: {}", python_exe.display());
+
+        // Create lib directory in temp
+        let lib_dir = temp_dir.path().join("site-packages");
+        fs::create_dir_all(&lib_dir)?;
+
+        // Install packages using the extracted Python
+        self.pip_install_with_exe(&python_exe, &lib_dir, &packages)?;
+
+        // Bundle the installed packages into overlay
+        let mut count = 0;
+        let mut skipped_size = 0u64;
+
+        for entry in walkdir::WalkDir::new(&lib_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let rel_path = entry.path().strip_prefix(&lib_dir).unwrap_or(entry.path());
+
+            let path_str = rel_path.to_string_lossy();
+
+            // Skip files that aren't needed at runtime
+            let should_skip = path_str.contains("__pycache__")
+                || path_str.contains(".dist-info")
+                || path_str.contains(".egg-info")
+                || path_str.ends_with(".pyc")
+                || path_str.ends_with(".pyo")
+                || path_str.ends_with(".pdb")  // Debug symbols
+                || path_str.ends_with(".exe")  // Executables in packages
+                || path_str.contains("/tests/")
+                || path_str.contains("/test/")
+                || path_str.contains("/testing/")
+                || path_str.contains("/_tests/")
+                || path_str.starts_with("tests/")
+                || path_str.starts_with("test/")
+                || path_str.contains("/examples/")
+                || path_str.contains("/docs/")
+                || path_str.contains("/doc/")
+                || path_str.ends_with("_test.py")
+                || path_str.ends_with("_tests.py")
+                || path_str.ends_with(".md")    // Documentation
+                || path_str.ends_with(".rst")   // Documentation
+                || path_str.ends_with(".txt") && !path_str.ends_with("LICENSE.txt")
+                || path_str.contains("/locale/") && !path_str.contains("/en/")  // Keep only English
+                || path_str.contains("/grpc_tools/")  // grpc compilation tools
+                || path_str.contains("/_cython/")     // Cython source
+                || (path_str.contains("google/") && path_str.ends_with(".proto")); // Proto files
+
+            if should_skip {
+                if let Ok(meta) = entry.metadata() {
+                    skipped_size += meta.len();
+                }
+                continue;
+            }
+
+            let content = fs::read(entry.path())?;
+            overlay.add_asset(
+                format!("lib/{}", rel_path.to_string_lossy().replace('\\', "/")),
+                content,
+            );
+            count += 1;
+        }
+
+        tracing::info!(
+            "Bundled {} package files into overlay (skipped {:.2} MB)",
+            count,
+            skipped_size as f64 / (1024.0 * 1024.0)
+        );
+        Ok(count)
     }
 
     /// Collect additional resources from hooks configuration
@@ -2041,6 +2302,7 @@ impl PackConfig {
             windows_resource,
             vx: manifest.vx.clone(),
             downloads: manifest.downloads.clone(),
+            compression_level: manifest.build.compression_level,
         })
     }
 }
