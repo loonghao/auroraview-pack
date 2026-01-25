@@ -4,11 +4,13 @@
 //! Common types are re-exported from the `common` module for consistency.
 
 use crate::common::{
-    default_module_search_paths, default_optimize, default_python_version, HooksConfig,
+    default_module_search_paths, default_optimize, default_python_version, CollectPattern,
+    HooksConfig, VxHooksConfig,
 };
 use crate::protection::ProtectionConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 // Re-export common types
@@ -326,6 +328,10 @@ pub struct PackConfig {
     /// Recommended: 19 for release, 3 for development
     #[serde(default = "default_compression_level")]
     pub compression_level: i32,
+
+    /// Chrome extensions configuration
+    #[serde(default)]
+    pub extensions: Option<crate::manifest::ExtensionsConfig>,
 }
 
 /// Default compression level (19 = high compression, good for releases)
@@ -397,6 +403,7 @@ impl PackConfig {
             vx: None,
             downloads: vec![],
             compression_level: default_compression_level(),
+            extensions: None,
         }
     }
 
@@ -430,6 +437,7 @@ impl PackConfig {
             vx: None,
             downloads: vec![],
             compression_level: default_compression_level(),
+            extensions: None,
         }
     }
 
@@ -466,6 +474,7 @@ impl PackConfig {
             vx: None,
             downloads: vec![],
             compression_level: default_compression_level(),
+            extensions: None,
         }
     }
 
@@ -505,6 +514,7 @@ impl PackConfig {
             vx: None,
             downloads: vec![],
             compression_level: default_compression_level(),
+            extensions: None,
         }
     }
 
@@ -622,5 +632,178 @@ impl PackConfig {
             verbose: false,
             remote_debugging_port: self.remote_debugging_port,
         }
+    }
+
+    /// Create PackConfig from a Manifest
+    pub fn from_manifest(
+        manifest: &crate::Manifest,
+        base_dir: &Path,
+    ) -> Result<Self, crate::PackError> {
+        use crate::manifest::BackendType;
+
+        // Determine mode based on frontend and backend config
+        let mode = if let Some(ref fe) = manifest.frontend {
+            if let Some(ref url) = fe.url {
+                PackMode::Url { url: url.clone() }
+            } else if let Some(ref path) = fe.path {
+                let full_path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    base_dir.join(path)
+                };
+
+                // Check if backend is configured for fullstack mode
+                if let Some(ref backend) = manifest.backend {
+                    if backend.backend_type == BackendType::Python {
+                        // Use the manifest's get_python_bundle_config which properly resolves all fields
+                        if let Some(python_config) = manifest.get_python_bundle_config(base_dir) {
+                            return Self::fullstack_with_config(full_path, python_config)
+                                .apply_manifest(manifest, base_dir);
+                        }
+                    }
+                }
+
+                PackMode::Frontend { path: full_path }
+            } else {
+                return Err(crate::PackError::Config(
+                    "Frontend must have either 'path' or 'url' specified".to_string(),
+                ));
+            }
+        } else {
+            return Err(crate::PackError::Config(
+                "No frontend configuration specified in manifest".to_string(),
+            ));
+        };
+
+        // Build base config from mode
+        let mut config = match &mode {
+            PackMode::Url { url } => Self::url(url),
+            PackMode::Frontend { path } => Self::frontend(path),
+            _ => unreachable!(),
+        };
+
+        config.mode = mode;
+        config.apply_manifest(manifest, base_dir)
+    }
+
+    /// Apply manifest settings to this config
+    fn apply_manifest(
+        mut self,
+        manifest: &crate::Manifest,
+        base_dir: &Path,
+    ) -> Result<Self, crate::PackError> {
+        // Package settings
+        self.output_name = manifest.package.name.clone();
+
+        // Output directory
+        if let Some(ref out_dir) = manifest.build.out_dir {
+            self.output_dir = if out_dir.is_absolute() {
+                out_dir.clone()
+            } else {
+                base_dir.join(out_dir)
+            };
+        }
+
+        // Window settings (window is not Option, it has default)
+        let win = &manifest.window;
+        self.window = WindowConfig {
+            title: manifest
+                .package
+                .title
+                .clone()
+                .unwrap_or_else(|| manifest.package.name.clone()),
+            width: win.width,
+            height: win.height,
+            min_width: win.min_width,
+            min_height: win.min_height,
+            max_width: win.max_width,
+            max_height: win.max_height,
+            resizable: win.resizable,
+            fullscreen: win.fullscreen,
+            frameless: win.frameless,
+            always_on_top: win.always_on_top,
+            transparent: win.transparent,
+            start_position: win.start_position.clone().into(),
+            maximized: win.maximized,
+            visible: win.visible,
+        };
+
+        // Debug settings
+        self.debug = manifest.debug.enabled;
+
+        // Allow new window
+        self.allow_new_window = manifest.package.allow_new_window;
+
+        // User agent
+        self.user_agent = manifest.package.user_agent.clone();
+
+        // Injection settings
+        if let Some(ref inject) = manifest.inject {
+            self.inject_js = inject.js_code.clone();
+            self.inject_css = inject.css_code.clone();
+        }
+
+        // Icon path - use platform-specific icon if available
+        if let Some(icon) = manifest.get_icon_path() {
+            let icon_path = if icon.is_absolute() {
+                icon.clone()
+            } else {
+                base_dir.join(icon)
+            };
+            self.icon_path = Some(icon_path);
+        }
+
+        // Environment variables
+        if let Some(ref runtime) = manifest.runtime {
+            self.env = runtime.env.clone();
+        }
+
+        // License settings
+        if let Some(ref l) = manifest.license {
+            self.license = Some(LicenseConfig {
+                enabled: l.enabled,
+                expires_at: l.expires_at.clone(),
+                require_token: l.require_token,
+                embedded_token: l.embedded_token.clone(),
+                validation_url: l.validation_url.clone(),
+                allowed_machines: l.allowed_machines.clone(),
+                grace_period_days: l.grace_period_days,
+                expiration_message: l.expiration_message.clone(),
+            });
+        }
+
+        // Hooks settings
+        if let Some(ref hooks) = manifest.hooks {
+            self.hooks = Some(HooksConfig {
+                before_collect: hooks.before_collect.clone(),
+                collect: hooks
+                    .collect
+                    .iter()
+                    .map(|c| CollectPattern {
+                        source: c.source.clone(),
+                        dest: c.dest.clone(),
+                        preserve_structure: c.preserve_structure,
+                        description: c.description.clone(),
+                    })
+                    .collect(),
+                after_pack: hooks.after_pack.clone(),
+                use_vx: hooks.use_vx,
+                vx: VxHooksConfig {
+                    before_collect: hooks.vx.before_collect.clone(),
+                    after_pack: hooks.vx.after_pack.clone(),
+                },
+            });
+        }
+
+        // Vx settings
+        self.vx = manifest.vx.clone();
+
+        // Downloads settings
+        self.downloads = manifest.downloads.clone();
+
+        // Extensions settings
+        self.extensions = manifest.extensions.clone();
+
+        Ok(self)
     }
 }
